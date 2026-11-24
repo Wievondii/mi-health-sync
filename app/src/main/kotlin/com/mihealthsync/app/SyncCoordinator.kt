@@ -138,8 +138,7 @@ internal class SyncCoordinator(private val app: Application) {
                 }
                 progress.value = "同步${metric.title}"
                 val previous = dao.cursor(session.accountScope(), metric.name)
-                val queryStart = syncStart(queryEnd, from, previous, state.firstDays, state.overlapHours,
-                    completedDaysOnly = metric.completedDaysOnly)
+                val queryStart = syncStart(queryEnd, from, previous, state.firstDays, state.overlapHours)
                 if (queryStart >= queryEnd) continue
                 try {
                     val includeRoutes = metric == Metric.EXERCISE && ROUTE_PERMISSION in permissions

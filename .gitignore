@@ -2,6 +2,8 @@
 .kotlin/
 .idea/
 .codegraph/
+.codex-attachments/
+.commandcode/
 **/build/
 local.properties
 *.apk

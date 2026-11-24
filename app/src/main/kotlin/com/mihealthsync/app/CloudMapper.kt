@@ -50,9 +50,7 @@ internal enum class Metric(val title: String, val permission: String) {
     ACTIVE_CALORIES("活动热量", HealthPermission.getWritePermission(ActiveCaloriesBurnedRecord::class)),
     SPEED("锻炼速度", HealthPermission.getWritePermission(SpeedRecord::class)),
     TOTAL_CALORIES("锻炼总热量", HealthPermission.getWritePermission(TotalCaloriesBurnedRecord::class)),
-    WEIGHT("体重", HealthPermission.getWritePermission(WeightRecord::class));
-
-    val completedDaysOnly get() = this == STEPS || this == ACTIVE_CALORIES
+    WEIGHT("体重", HealthPermission.getWritePermission(WeightRecord::class)),
 }
 
 internal data class CloudRow(
@@ -80,14 +78,8 @@ internal class CloudMapper(private val cloud: MiCloud, private val account: MiCl
                 oxygen(CloudRows(automatic.rows + manual.rows, automatic.rejected + manual.rejected), start, end)
             }
             Metric.STEPS, Metric.ACTIVE_CALORIES -> {
-                val completedDay = minOf(lastDay, end.atZone(CHINA).toLocalDate().minusDays(1))
-                if (completedDay < firstDay) MappedBatch(emptyList(), 0, null)
-                else {
-                    val kind = if (metric == Metric.STEPS) MiCloud.Metric.STEPS else MiCloud.Metric.CALORIES_DAILY
-                    val source = dayRows(kind, firstDay, completedDay)
-                    if (metric == Metric.STEPS) steps(source, firstDay, completedDay)
-                    else activeCalories(source, firstDay, completedDay)
-                }
+                val kind = if (metric == Metric.STEPS) MiCloud.Metric.STEPS else MiCloud.Metric.CALORIES_DAILY
+                dailyActivity(metric, dayRows(kind, firstDay, lastDay), firstDay, lastDay, end)
             }
             Metric.RESTING -> resting(dayRows(MiCloud.Metric.RESTING_HEART_RATE, firstDay, lastDay), firstDay, lastDay)
             Metric.SLEEP -> sleep(firstDay, lastDay, start, end)
@@ -165,23 +157,6 @@ internal class CloudMapper(private val cloud: MiCloud, private val account: MiCl
         return MappedBatch(records, source.rejected + window.size - usable.size, usable.maxOfOrNull { it.time })
     }
 
-    private fun steps(source: CloudRows, first: LocalDate, last: LocalDate): MappedBatch {
-        val rows = source.rows.inDays(first, last)
-        val usable = rows.filter { it.value.whole("steps") in 1L..1_000_000L }
-        val records = usable.latestPerTime().map { row ->
-            val day = row.day()
-            val start = day.atStartOfDay(CHINA)
-            val end = day.plusDays(1).atStartOfDay(CHINA)
-            val count = row.value.whole("steps")!!
-            candidate(Metric.STEPS, day.toString(), count.toString()) { metadata ->
-                StepsRecord(start.toInstant(), start.offset, end.toInstant(), end.offset, count, metadata)
-            }
-        }
-        val zeroDays = rows.count { it.value.whole("steps") == 0L }
-        val latestDayEnd = usable.maxOfOrNull { it.day().plusDays(1).atStartOfDay(CHINA).toEpochSecond() }
-        return MappedBatch(records, source.rejected + rows.size - usable.size - zeroDays, latestDayEnd)
-    }
-
     private fun resting(source: CloudRows, first: LocalDate, last: LocalDate): MappedBatch {
         val rows = source.rows.inDays(first, last)
         val usable = rows.filter { it.value.whole("bpm") in 1L..300L && it.value.whole("date_time") == it.time }
@@ -201,24 +176,31 @@ internal class CloudMapper(private val cloud: MiCloud, private val account: MiCl
         return MappedBatch(records, source.rejected + rows.size - usable.size, latestDay)
     }
 
-    private fun activeCalories(source: CloudRows, first: LocalDate, last: LocalDate): MappedBatch {
+    private fun dailyActivity(metric: Metric, source: CloudRows, first: LocalDate, last: LocalDate,
+                              through: Instant): MappedBatch {
         val rows = source.rows.inDays(first, last).latestPerTime()
+        val measuringSteps = metric == Metric.STEPS
         var invalid = source.rejected
         var latest: Long? = null
         val records = rows.mapNotNull { row ->
-            val kcal = row.value.number("calories")
-            if (kcal == null || kcal !in 0.0..100_000.0) {
+            val amount: Number? = if (measuringSteps) row.value.whole("steps")?.takeIf { it in 0L..1_000_000L }
+                else row.value.number("calories")?.takeIf { it in 0.0..100_000.0 }
+            if (amount == null) {
                 invalid++
                 return@mapNotNull null
             }
-            if (kcal == 0.0) return@mapNotNull null
+            if (amount.toDouble() == 0.0) return@mapNotNull null
             val day = row.day()
-            val start = day.atStartOfDay(CHINA)
-            val end = day.plusDays(1).atStartOfDay(CHINA)
-            latest = maxOf(latest ?: 0, end.toEpochSecond())
-            candidate(Metric.ACTIVE_CALORIES, day.toString(), kcal.toString()) { metadata ->
-                ActiveCaloriesBurnedRecord(start.toInstant(), start.offset, end.toInstant(), end.offset,
-                    Energy.kilocalories(kcal), metadata)
+            val window = dailyActivityWindow(day, through) ?: return@mapNotNull null
+            latest = maxOf(latest ?: 0, window.end.epochSecond)
+            val zone = CHINA.rules.getOffset(window.start)
+            candidate(metric, day.toString(), window.revisionContent(amount)) { metadata ->
+                if (measuringSteps) {
+                    StepsRecord(window.start, zone, window.end, zone, amount.toLong(), metadata)
+                } else {
+                    ActiveCaloriesBurnedRecord(window.start, zone, window.end, zone,
+                        Energy.kilocalories(amount.toDouble()), metadata)
+                }
             }
         }
         return MappedBatch(records, invalid, latest)
