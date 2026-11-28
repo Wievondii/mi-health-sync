@@ -12,6 +12,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpCookie;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.ByteBuffer;
@@ -30,39 +31,50 @@ import java.util.TreeMap;
 /** 本人小米大陆云端的只读客户端。协议来源见第三方许可证说明。 */
 public final class MiCloud {
     private static final String ACCOUNT = "https://account.xiaomi.com";
+    private static final String RENEW_PATH = "/pass/serviceLogin";
     private static final String HEALTH = "https://hlth.io.mi.com";
     private static final String RAW_PATH = "/app/v1/data/get_fitness_data_by_time";
     private static final String DAILY_PATH = "/app/v1/data/get_aggregated_fitness_data_by_time";
     private static final String SPORT_PATH = "/app/v1/data/get_sport_records_by_time";
     private static final String FILE_SIGN_PATH = "/service/gen_download_url";
     private static final int MAX_BODY_BYTES = 4 * 1024 * 1024;
-    private final String deviceCookie;
-    private final HealthConnection healthConnection;
+    private final String deviceId;
+    private final ConnectionFactory healthConnection;
+    private final ConnectionFactory accountConnection;
 
     public MiCloud() {
         this(url -> (HttpsURLConnection) url.openConnection());
     }
 
-    MiCloud(HealthConnection healthConnection) {
-        this.healthConnection = healthConnection;
-        byte[] bytes = new byte[8];
-        new SecureRandom().nextBytes(bytes);
-        StringBuilder id = new StringBuilder("deviceId=");
-        for (byte b : bytes) id.append(String.format(java.util.Locale.ROOT, "%02X", b & 255));
-        deviceCookie = id.toString();
+    MiCloud(ConnectionFactory healthConnection) {
+        this(healthConnection, url -> (HttpsURLConnection) url.openConnection());
     }
 
-    interface HealthConnection {
+    MiCloud(ConnectionFactory healthConnection, ConnectionFactory accountConnection) {
+        this.healthConnection = healthConnection;
+        this.accountConnection = accountConnection;
+        byte[] bytes = new byte[8];
+        new SecureRandom().nextBytes(bytes);
+        StringBuilder id = new StringBuilder();
+        for (byte b : bytes) id.append(String.format(java.util.Locale.ROOT, "%02X", b & 255));
+        deviceId = id.toString();
+    }
+
+    interface ConnectionFactory {
         HttpsURLConnection open(URL url) throws IOException;
     }
 
     public static final class Challenge {
-        final Uri poll;
+        private final URL poll;
+        private final String deviceId;
         public final byte[] qrImage;
+        public final Uri approvalPage;
 
-        Challenge(Uri poll, byte[] qrImage) {
+        Challenge(URL poll, byte[] qrImage, Uri approvalPage, String deviceId) {
             this.poll = poll;
             this.qrImage = qrImage;
+            this.approvalPage = approvalPage;
+            this.deviceId = deviceId;
         }
     }
 
@@ -79,23 +91,65 @@ public final class MiCloud {
         private final String account;
         private final String cookie;
         private final String security;
+        private final Renewal renewal;
 
-        private Session(String account, String cookie, String security) {
+        private Session(String account, String cookie, String security, Renewal renewal) {
             this.account = account;
             this.cookie = cookie;
             this.security = security;
+            this.renewal = renewal;
         }
 
         public String accountScope() { return account; }
+        public boolean canRenew() { return renewal != null; }
+
+        public Session withoutRenewal() {
+            return renewal == null ? this : new Session(account, cookie, security, null);
+        }
 
         public byte[] encode() throws Exception {
-            return new JSONObject().put("account", account).put("cookie", cookie).put("security", security)
-                    .toString().getBytes(StandardCharsets.UTF_8);
+            JSONObject value = new JSONObject().put("account", account).put("cookie", cookie).put("security", security);
+            if (renewal != null) value.put("renewal", renewal.encode());
+            return value.toString().getBytes(StandardCharsets.UTF_8);
         }
 
         public static Session decode(byte[] bytes) throws Exception {
             JSONObject value = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-            return new Session(value.getString("account"), value.getString("cookie"), value.getString("security"));
+            String account = value.getString("account");
+            JSONObject fields = value.optJSONObject("renewal");
+            Renewal renewal = fields == null ? null : Renewal.create(account, fields.optString("userId"),
+                    fields.optString("cUserId"), fields.optString("passToken"), fields.optString("deviceId"));
+            return new Session(account, value.getString("cookie"), value.getString("security"), renewal);
+        }
+    }
+
+    private static final class Renewal {
+        final String userId;
+        final String cUserId;
+        final String passToken;
+        final String deviceId;
+
+        private Renewal(String userId, String cUserId, String passToken, String deviceId) {
+            this.userId = userId;
+            this.cUserId = cUserId;
+            this.passToken = passToken;
+            this.deviceId = deviceId;
+        }
+
+        static Renewal create(String account, String userId, String cUserId, String passToken, String deviceId)
+                throws Exception {
+            if (!validCookie(userId) || !validCookie(cUserId) || !validCookie(passToken)
+                    || !deviceId.matches("[0-9A-F]{16}") || !account.equals(scopeFor(userId))) return null;
+            return new Renewal(userId, cUserId, passToken, deviceId);
+        }
+
+        JSONObject encode() throws Exception {
+            return new JSONObject().put("userId", userId).put("cUserId", cUserId)
+                    .put("passToken", passToken).put("deviceId", deviceId);
+        }
+
+        String cookies() {
+            return "userId=" + userId + "; passToken=" + passToken + "; deviceId=" + deviceId;
         }
     }
 
@@ -126,14 +180,22 @@ public final class MiCloud {
     }
 
     public Challenge start() throws Exception {
-        Uri endpoint = Uri.parse(ACCOUNT + "/longPolling/loginUrl?sid=miothealth&_json=true");
-        Response response = get(endpoint, deviceCookie, false, 20000);
+        URL endpoint = new URL(ACCOUNT + "/longPolling/loginUrl?sid=miothealth&_json=true");
+        String deviceCookie = "deviceId=" + deviceId;
+        Response response = getAccount(endpoint, deviceCookie, 20000);
         JSONObject challenge = accountJson(response, "申请扫码");
-        Uri poll = trusted(challenge.optString("lp"), "(?:[a-z0-9-]+\\.)?lp\\.account\\.xiaomi\\.com", "/lp/s");
-        Uri qr = trusted(challenge.optString("qr"), "account\\.xiaomi\\.com", "/pass/qr/login");
-        Response image = get(qr, deviceCookie, false, 10000);
+        URL poll = trusted(challenge.optString("lp"), "(?:[a-z0-9-]+\\.)?lp\\.account\\.xiaomi\\.com", "/lp/s");
+        URL qr = trusted(challenge.optString("qr"), "account\\.xiaomi\\.com", "/pass/qr/login");
+        Response image = getAccount(qr, deviceCookie, 10000);
         if (image.status != 200) throw new ProbeFailure("无法加载小米二维码（HTTP " + image.status + "）。");
-        return new Challenge(poll, image.body);
+        Uri approvalPage = null;
+        try {
+            approvalPage = Uri.parse(trusted(challenge.optString("loginUrl"),
+                    "(?:[a-z0-9-]+\\.)?account\\.xiaomi\\.com", "/longPolling/login").toString());
+        } catch (ProbeFailure ignored) {
+            // 同机确认地址不可用时仍可正常扫码。
+        }
+        return new Challenge(poll, image.body, approvalPage, deviceId);
     }
 
     public Result readAfterApproval(Challenge challenge) throws Exception {
@@ -141,35 +203,88 @@ public final class MiCloud {
     }
 
     public Session complete(Challenge challenge) throws Exception {
-        Response approval = get(challenge.poll, deviceCookie, false, 130000);
+        return complete(challenge, false);
+    }
+
+    public Session complete(Challenge challenge, boolean retainRenewal) throws Exception {
+        Response approval = getAccount(challenge.poll, "deviceId=" + challenge.deviceId, 130000);
         if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
         JSONObject login = accountJson(approval, "小米账号确认");
-        if (login.optInt("securityStatus", 0) != 0) {
-            throw new ProbeFailure("小米要求额外安全验证，本次读取已停止。");
-        }
-        JSONObject extension = approval.pragma == null ? new JSONObject() : new JSONObject(approval.pragma);
+        checkSecurity(login, false);
         String userId = cookieValue(login, approval, "userId");
         String cUserId = cookieValue(login, approval, "cUserId");
+        String account = scopeFor(userId.isEmpty() ? cUserId : userId);
+        Renewal renewal = retainRenewal ? Renewal.create(account, userId, cUserId,
+                cookieValue(login, approval, "passToken"), challenge.deviceId) : null;
+        return issueSession(login, approval, account, userId, cUserId, renewal);
+    }
+
+    public Session renew(Session current) throws Exception {
+        if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+        Renewal previous = current.renewal;
+        if (previous == null) throw new RenewalRejected("本次登录没有可用于续期的授权。");
+        Response response = getAccount(new URL(ACCOUNT + RENEW_PATH + "?sid=miothealth&_json=true"),
+                previous.cookies(), 20000);
+        if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+        try {
+            JSONObject login = accountJson(response, "小米登录续期");
+            checkSecurity(login, true);
+            String returnedUserId = cookieValue(login, response, "userId");
+            String returnedCUserId = cookieValue(login, response, "cUserId");
+            String cookieUserId = response.cookies.getOrDefault("userId", "");
+            if ((!returnedUserId.isEmpty() && !previous.userId.equals(returnedUserId))
+                    || (!cookieUserId.isEmpty() && !previous.userId.equals(cookieUserId))
+                    || (returnedUserId.isEmpty() && !returnedCUserId.isEmpty()
+                        && !previous.cUserId.equals(returnedCUserId))) {
+                throw new RenewalRejected("续期返回的账号与原授权不一致。");
+            }
+            String cUserId = returnedCUserId.isEmpty() ? previous.cUserId : returnedCUserId;
+            String passToken = cookieValue(login, response, "passToken");
+            if (passToken.isEmpty()) passToken = previous.passToken;
+            Renewal next = Renewal.create(current.account, previous.userId, cUserId, passToken, previous.deviceId);
+            if (next == null) throw new RenewalRejected("小米返回的续期凭据无法验证。");
+            Session renewed = issueSession(login, response, current.account, previous.userId, cUserId, next);
+            if (current.cookie.equals(renewed.cookie) && current.security.equals(renewed.security)) {
+                throw new RenewalRejected("小米未返回更新的健康会话。");
+            }
+            return renewed;
+        } catch (ProbeFailure error) {
+            if (error.status == 408 || error.status == 429 || (error.status >= 500 && error.status <= 599)) throw error;
+            throw new RenewalRejected(error.getMessage());
+        }
+    }
+
+    private static void checkSecurity(JSONObject login, boolean renewing) throws ProbeFailure {
+        if (login.optInt("securityStatus", renewing && login.has("securityStatus") ? -1 : 0) != 0
+                || (renewing && !jsonText(login, "notificationUrl").isEmpty())) {
+            throw new ProbeFailure("小米要求本人完成安全验证。");
+        }
+    }
+
+    private Session issueSession(JSONObject login, Response approval, String account,
+                                 String userId, String cUserId, Renewal renewal) throws Exception {
+        JSONObject extension = approval.pragma == null ? new JSONObject() : accountObject(approval.pragma);
         String security = field(login, extension, "ssecurity");
         String nonce = field(login, extension, "nonce");
         if (security.isEmpty() || !nonce.matches("[0-9]+")) {
             throw new ProbeFailure("小米账号响应缺少签发健康会话所需字段。");
         }
-        Uri ticket = trusted(login.optString("location"), "sts-hlth\\.io\\.mi\\.com", "/healthapp/sts");
-        Uri exchange = ticket.buildUpon()
-                .appendQueryParameter("clientSign", sha1("nonce=" + nonce + "&" + security))
-                .appendQueryParameter("_userIdNeedEncrypt", "true").build();
-        Response session = get(exchange, null, false, 20000);
+        URL ticket = trusted(login.optString("location"), "sts-hlth\\.io\\.mi\\.com", "/healthapp/sts");
+        String signature = URLEncoder.encode(sha1("nonce=" + nonce + "&" + security), StandardCharsets.UTF_8.name());
+        URL exchange = new URL(ticket + (ticket.getQuery() == null ? "?" : "&")
+                + "clientSign=" + signature + "&_userIdNeedEncrypt=true");
+        if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+        Response session = getAccount(exchange, null, 20000);
+        if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
         if (session.status != 200 && session.status != 302) {
-            throw new ProbeFailure("健康会话签发失败（HTTP " + session.status + "）。");
+            throw new ProbeFailure("健康会话签发失败（HTTP " + session.status + "）。",
+                    session.status, session.retryAfter);
         }
         String token = session.cookies.get("miothealth_serviceToken");
         if (token == null) token = session.cookies.get("serviceToken");
         String cookies = "cUserId=" + checkedCookie(cUserId) + "; serviceToken=" + checkedCookie(token);
         if (!userId.isEmpty()) cookies += "; userId=" + checkedCookie(userId);
-        String scope = b64(MessageDigest.getInstance("SHA-256")
-                .digest((userId.isEmpty() ? cUserId : userId).getBytes(StandardCharsets.UTF_8)));
-        return new Session(scope, cookies, security);
+        return new Session(account, cookies, security, renewal);
     }
 
     public Page fetch(Session session, Metric metric, long start, long end, String cursor) throws Exception {
@@ -388,40 +503,76 @@ public final class MiCloud {
         }
     }
 
-    private static JSONObject accountJson(Response response, String phase) throws Exception {
-        if (response.status != 200) throw new ProbeFailure(phase + "失败（HTTP " + response.status + "）。");
+    private static JSONObject accountJson(Response response, String phase) throws ProbeFailure {
+        if (response.status != 200) throw new ProbeFailure(phase + "失败（HTTP " + response.status + "）。",
+                response.status, response.retryAfter);
         String text = response.text().trim();
         if (text.startsWith("&&&START&&&")) text = text.substring("&&&START&&&".length());
-        JSONObject json = new JSONObject(text);
+        JSONObject json = accountObject(text);
         int code = json.optInt("code", Integer.MIN_VALUE);
         if (code != 0) throw new ProbeFailure(phase + "未通过（业务码 " + code + "）。");
         return json;
     }
 
-    private static Uri trusted(String raw, String hostPattern, String path) throws ProbeFailure {
-        Uri uri = Uri.parse(raw);
-        if (!"https".equals(uri.getScheme()) || uri.getUserInfo() != null || uri.getPort() != -1
-                || uri.getHost() == null || !uri.getHost().matches(hostPattern) || !path.equals(uri.getPath())) {
-            throw new ProbeFailure("小米返回的地址与已核实的服务不一致，本次读取已停止。");
+    private static JSONObject accountObject(String text) throws ProbeFailure {
+        try {
+            return new JSONObject(text);
+        } catch (org.json.JSONException ignored) {
+            throw new ProbeFailure("小米账号响应格式无法验证。");
         }
-        return uri;
+    }
+
+    private static URL trusted(String raw, String hostPattern, String path) throws ProbeFailure {
+        try {
+            URI uri = URI.create(raw);
+            if ("https".equals(uri.getScheme()) && uri.getUserInfo() == null && uri.getPort() == -1
+                    && uri.getFragment() == null && uri.getHost() != null && uri.getHost().matches(hostPattern)
+                    && path.equals(uri.getRawPath())) {
+                return uri.toURL();
+            }
+        } catch (IllegalArgumentException | IOException ignored) {
+            // 地址包含一次性授权信息，诊断只输出固定文案。
+        }
+        throw new ProbeFailure("小米返回的地址与已核实的服务不一致，本次读取已停止。");
     }
 
     private static String field(JSONObject body, JSONObject fallback, String name) {
-        String result = body.optString(name, "");
-        return result.isEmpty() ? fallback.optString(name, "") : result;
+        String result = jsonText(body, name);
+        return result.isEmpty() ? jsonText(fallback, name) : result;
     }
 
     private static String cookieValue(JSONObject body, Response response, String name) {
-        String value = body.optString(name, "");
+        String value = jsonText(body, name);
         return value.isEmpty() ? response.cookies.getOrDefault(name, "") : value;
     }
 
+    private static String jsonText(JSONObject source, String name) {
+        Object field = source.opt(name);
+        return field instanceof String || field instanceof Number ? field.toString() : "";
+    }
+
+    private static String scopeFor(String identity) throws Exception {
+        return b64(MessageDigest.getInstance("SHA-256").digest(identity.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static boolean validCookie(String value) {
+        return value != null && value.matches("[\\x21-\\x7E&&[^;\"\\\\,]]+");
+    }
+
     private static String checkedCookie(String value) throws ProbeFailure {
-        if (value == null || value.isEmpty() || !value.matches("[\\x21-\\x7E&&[^;\"\\\\,]]+")) {
+        if (!validCookie(value)) {
             throw new ProbeFailure("小米未返回可用的健康会话。");
         }
         return value;
+    }
+
+    private Response getAccount(URL url, String cookie, int timeout) throws IOException {
+        try {
+            return get(accountConnection.open(url), cookie, false, timeout);
+        } catch (IOException ignored) {
+            // 底层报错有时会带上含一次性凭据的地址。
+            throw new IOException("小米账号服务暂不可连接。");
+        }
     }
 
     private static Response get(Uri url, String cookie, boolean health, int timeout) throws IOException {
@@ -496,5 +647,9 @@ public final class MiCloud {
             this.status = status;
             this.retryAfter = retryAfter;
         }
+    }
+
+    public static final class RenewalRejected extends Exception {
+        private RenewalRejected(String message) { super(message); }
     }
 }

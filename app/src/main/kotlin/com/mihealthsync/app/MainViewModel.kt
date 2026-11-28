@@ -3,6 +3,7 @@ package com.mihealthsync.app
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.Uri
 import androidx.health.connect.client.HealthConnectClient
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -28,6 +29,7 @@ internal class MainViewModel(app: Application) : AndroidViewModel(app) {
     val permitted = MutableStateFlow<Set<String>>(emptySet())
     val healthStatus = MutableStateFlow(HealthConnectClient.SDK_UNAVAILABLE)
     val qr = MutableStateFlow<Bitmap?>(null)
+    val approvalPage = MutableStateFlow<Uri?>(null)
     val authenticating = MutableStateFlow(false)
     val notice = MutableStateFlow<String?>(null)
     private var loginJob: Job? = null
@@ -37,6 +39,13 @@ internal class MainViewModel(app: Application) : AndroidViewModel(app) {
             repository.refreshSession()
             repository.reschedule()
         }
+    }
+
+    fun refreshLogin() = viewModelScope.launch { repository.refreshSession() }
+
+    fun openRelogin() = viewModelScope.launch {
+        repository.refreshSession()
+        if (repository.accountState.value == AccountState.EXPIRED) login()
     }
 
     fun refreshHealth() = viewModelScope.launch {
@@ -61,10 +70,16 @@ internal class MainViewModel(app: Application) : AndroidViewModel(app) {
                 qr.value = withContext(Dispatchers.Default) {
                     BitmapFactory.decodeByteArray(challenge.qrImage, 0, challenge.qrImage.size)
                 } ?: throw IOException("二维码图片无效")
-                notice.value = "请用小米官方应用扫码，并确认本人登录"
-                val session = runInterruptible(Dispatchers.IO) { client.complete(challenge) }
+                approvalPage.value = challenge.approvalPage
+                notice.value = "请在小米官方页面确认本人登录"
+                val retainRenewal = repository.settings.current().autoRenewal
+                val session = runInterruptible(Dispatchers.IO) { client.complete(challenge, retainRenewal) }
                 repository.connect(session)
-                notice.value = "小米账号已连接"
+                notice.value = when {
+                    repository.renewalReady.value -> "小米账号已连接，自动续期已就绪"
+                    retainRenewal -> "小米账号已连接，本次授权未取得续期凭据"
+                    else -> "小米账号已连接"
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: MiCloud.ProbeFailure) {
@@ -74,6 +89,7 @@ internal class MainViewModel(app: Application) : AndroidViewModel(app) {
             } catch (_: Exception) {
                 notice.value = "连接或安全存储失败，请重试"
             } finally {
+                approvalPage.value = null
                 qr.value = null
                 authenticating.value = false
             }
@@ -96,8 +112,22 @@ internal class MainViewModel(app: Application) : AndroidViewModel(app) {
         repository.reschedule()
     }
 
+    fun setAutoRenewal(enabled: Boolean) = viewModelScope.launch {
+        try {
+            repository.setAutoRenewal(enabled)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            notice.value = "无法保存自动续期设置，请重试"
+        }
+    }
+
     fun syncNow(from: Instant? = null, through: Instant? = null) {
-        if (!repository.connected.value) { notice.value = "请先扫码登录"; return }
+        val account = repository.accountState.value
+        if (account != AccountState.CONNECTED) {
+            notice.value = if (account == AccountState.EXPIRED) "小米账号登录已过期，请重新扫码登录" else "请先扫码登录"
+            return
+        }
         if (Metric.entries.none { it in settings.value.enabled && it.permission in permitted.value }) {
             notice.value = "请为至少一种数据开启 Health Connect 写入权限"
             return

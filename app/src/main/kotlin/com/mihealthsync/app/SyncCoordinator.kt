@@ -56,24 +56,46 @@ internal class SyncCoordinator(private val app: Application) {
     private val dao get() = db.syncDao()
     private val manager get() = WorkManager.getInstance(app)
     private val lock = Mutex()
-    val connected = MutableStateFlow(false)
+    val accountState = MutableStateFlow(AccountState.SIGNED_OUT)
+    val renewalReady = MutableStateFlow(false)
     val events get() = dao.events()
     val progress = MutableStateFlow<String?>(null)
     val work get() = manager.getWorkInfosByTagFlow(WORK_TAG)
 
-    suspend fun refreshSession() { connected.value = loadSession() != null }
+    suspend fun refreshSession() = lock.withLock {
+        loadSession()
+    }
 
     suspend fun connect(session: MiCloud.Session) = lock.withLock {
-        withContext(Dispatchers.IO) { sessionStore.save(session) }
-        connected.value = true
+        val saved = if (settings.current().autoRenewal) session else session.withoutRenewal()
+        withContext(Dispatchers.IO) { sessionStore.save(saved) }
+        accountState.value = AccountState.CONNECTED
+        renewalReady.value = saved.canRenew()
+        LoginExpiryNotification.cancel(app)
         reschedule()
+    }
+
+    suspend fun setAutoRenewal(enabled: Boolean) = lock.withLock {
+        if (!enabled) {
+            withContext(Dispatchers.IO) {
+                val stored = sessionStore.load()
+                if (stored is StoredSession.Connected && stored.session.canRenew()) {
+                    sessionStore.save(stored.session.withoutRenewal())
+                }
+            }
+            renewalReady.value = false
+        }
+        settings.update { it.copy(autoRenewal = enabled) }
     }
 
     suspend fun signOut() {
         manager.cancelAllWorkByTag(WORK_TAG)
         lock.withLock {
             withContext(Dispatchers.IO) { sessionStore.clear() }
-            connected.value = false
+            accountState.value = AccountState.SIGNED_OUT
+            renewalReady.value = false
+            settings.update { it.copy(autoRenewal = false) }
+            LoginExpiryNotification.cancel(app)
         }
     }
 
@@ -86,7 +108,7 @@ internal class SyncCoordinator(private val app: Application) {
 
     suspend fun reschedule() {
         val state = settings.current()
-        if (!state.automatic || !connected.value) {
+        if (!state.automatic || accountState.value != AccountState.CONNECTED) {
             manager.cancelUniqueWork(PERIODIC_WORK)
             return
         }
@@ -113,8 +135,11 @@ internal class SyncCoordinator(private val app: Application) {
     suspend fun runSync(manual: Boolean, from: Long, through: Long, runAttempt: Int): SyncOutcome = lock.withLock {
         val state = settings.current()
         if (!manual && !state.automatic) return@withLock SyncOutcome.DONE
-        val session = loadSession() ?: return@withLock logGeneral("请先扫码登录")
-        connected.value = true
+        var session = when (val stored = loadSession()) {
+            is StoredSession.Connected -> stored.session
+            is StoredSession.Expired -> return@withLock pauseExpiredSync()
+            StoredSession.Missing, StoredSession.SignedOut -> return@withLock logGeneral("请先扫码登录")
+        }
         if (state.wifiOnly && !isWifi()) return@withLock logGeneral("等待 Wi-Fi")
         if (state.retryUntilMillis > System.currentTimeMillis()) {
             deferredRateLimit(manual, from, through, state.retryUntilMillis)
@@ -126,7 +151,9 @@ internal class SyncCoordinator(private val app: Application) {
         val client = HealthConnectClient.getOrCreate(app)
         val end = Instant.now().truncatedTo(ChronoUnit.MINUTES)
         val queryEnd = if (through > 0) minOf(end, Instant.ofEpochSecond(through)) else end
-        val mapper = CloudMapper(MiCloud(), session)
+        val cloud = MiCloud()
+        var mapper = CloudMapper(cloud, session)
+        var renewalAttempted = false
         var retry = false
         try {
             for (metric in state.enabled.sortedBy { it.ordinal }) {
@@ -142,7 +169,36 @@ internal class SyncCoordinator(private val app: Application) {
                 if (queryStart >= queryEnd) continue
                 try {
                     val includeRoutes = metric == Metric.EXERCISE && ROUTE_PERMISSION in permissions
-                    val batch = mapper.fetch(metric, queryStart, queryEnd, includeRoutes)
+                    val batch = try {
+                        mapper.fetch(metric, queryStart, queryEnd, includeRoutes)
+                    } catch (failure: MiCloud.ProbeFailure) {
+                        if (failure.status != 401 || renewalAttempted || !state.autoRenewal || !session.canRenew()) {
+                            throw failure
+                        }
+                        renewalAttempted = true
+                        progress.value = "正在续期小米登录"
+                        val previousSession = session
+                        session = try {
+                            // 在同一个 IO 块保存轮换后的凭据，防止取消任务时丢失已取得的续期结果。
+                            withContext(Dispatchers.IO) {
+                                cloud.renew(previousSession).also { sessionStore.save(it) }
+                            }
+                        } catch (_: MiCloud.RenewalRejected) {
+                            return@withLock expireSession()
+                        } catch (error: MiCloud.ProbeFailure) {
+                            if (error.status == 429) {
+                                return@withLock deferLimitedSync(manual, from, through, runAttempt, error.retryAfter)
+                            }
+                            return@withLock retryRenewalLater(runAttempt)
+                        } catch (_: IOException) {
+                            return@withLock retryRenewalLater(runAttempt)
+                        }
+                        renewalReady.value = session.canRenew()
+                        record(null, "小米登录已自动续期，继续同步")
+                        mapper = CloudMapper(cloud, session)
+                        progress.value = "同步${metric.title}"
+                        mapper.fetch(metric, queryStart, queryEnd, includeRoutes)
+                    }
                     val pulled = System.currentTimeMillis()
                     val batchSize = when {
                         includeRoutes -> 1
@@ -173,16 +229,10 @@ internal class SyncCoordinator(private val app: Application) {
                     record(metric, error.message ?: "云端读取失败")
                     when (error.status) {
                         401 -> {
-                            withContext(Dispatchers.IO) { sessionStore.clear() }
-                            connected.value = false
-                            manager.cancelUniqueWork(PERIODIC_WORK)
-                            return@withLock logGeneral("小米会话已过期，请重新扫码")
+                            return@withLock expireSession()
                         }
                         429 -> {
-                            val retryAt = refillAt(error.retryAfter, Instant.now())
-                            settings.update { it.copy(retryUntilMillis = retryAt) }
-                            if (runAttempt < 3) deferredRateLimit(manual, from, through, retryAt, runAttempt + 1)
-                            return@withLock SyncOutcome.DONE
+                            return@withLock deferLimitedSync(manual, from, through, runAttempt, error.retryAfter)
                         }
                         in 500..599 -> retry = true
                     }
@@ -232,7 +282,57 @@ internal class SyncCoordinator(private val app: Application) {
         return WriteCounts(batch.records.size, added, updated, skipped, batch.rejected, batch.latest)
     }
 
-    private suspend fun loadSession() = withContext(Dispatchers.IO) { sessionStore.load() }
+    private suspend fun loadSession(): StoredSession {
+        var stored = withContext(Dispatchers.IO) { sessionStore.load() }
+        // 旧版清除过期会话后只保留日志，升级时恢复仍待处理的最后一条过期状态。
+        if (stored == StoredSession.Missing && dao.latestStatus() == "小米会话已过期，请重新扫码") {
+            withContext(Dispatchers.IO) { sessionStore.markExpired() }
+            stored = StoredSession.Expired(notified = false)
+        }
+        accountState.value = when (stored) {
+            is StoredSession.Connected -> AccountState.CONNECTED
+            is StoredSession.Expired -> AccountState.EXPIRED
+            StoredSession.Missing, StoredSession.SignedOut -> AccountState.SIGNED_OUT
+        }
+        renewalReady.value = stored is StoredSession.Connected && stored.session.canRenew()
+        if (stored is StoredSession.Expired) notifyExpiry(stored)
+        return stored
+    }
+
+    private suspend fun notifyExpiry(stored: StoredSession.Expired) {
+        if (!stored.notified && LoginExpiryNotification.post(app)) {
+            withContext(Dispatchers.IO) { sessionStore.markExpired(notified = true) }
+        }
+    }
+
+    private suspend fun expireSession(): SyncOutcome {
+        withContext(Dispatchers.IO) { sessionStore.markExpired() }
+        accountState.value = AccountState.EXPIRED
+        renewalReady.value = false
+        notifyExpiry(StoredSession.Expired(notified = false))
+        return pauseExpiredSync()
+    }
+
+    private suspend fun retryRenewalLater(runAttempt: Int): SyncOutcome {
+        record(null, "小米续期暂不可用，等待下次重试")
+        return if (runAttempt < 3) SyncOutcome.RETRY else SyncOutcome.DONE
+    }
+
+    private suspend fun deferLimitedSync(
+        manual: Boolean, from: Long, through: Long, runAttempt: Int, retryAfter: String?,
+    ): SyncOutcome {
+        val retryAt = refillAt(retryAfter, Instant.now())
+        settings.update { it.copy(retryUntilMillis = retryAt) }
+        if (runAttempt < 3) deferredRateLimit(manual, from, through, retryAt, runAttempt + 1)
+        return logGeneral("云端限流，等待重试")
+    }
+
+    private suspend fun pauseExpiredSync(): SyncOutcome {
+        record(null, "小米账号登录已过期，同步已暂停，请重新扫码")
+        manager.cancelUniqueWork(RETRY_WORK)
+        manager.cancelUniqueWork(PERIODIC_WORK)
+        return SyncOutcome.DONE
+    }
 
     private suspend fun record(metric: Metric?, status: String) = db.withTransaction {
         dao.append(SyncEvent(timeMillis = System.currentTimeMillis(), metric = metric?.name ?: "", status = status))
@@ -263,6 +363,7 @@ internal class SyncCoordinator(private val app: Application) {
 }
 
 internal enum class SyncOutcome { DONE, RETRY }
+internal enum class AccountState { SIGNED_OUT, CONNECTED, EXPIRED }
 
 private data class WriteCounts(val total: Int, val added: Int, val updated: Int, val skipped: Int, val rejected: Int, val latest: Long?)
 

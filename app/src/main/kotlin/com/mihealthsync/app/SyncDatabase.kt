@@ -68,6 +68,9 @@ internal data class SyncEvent(
 
     @Query("SELECT * FROM sync_events ORDER BY id DESC LIMIT 150")
     fun events(): Flow<List<SyncEvent>>
+
+    @Query("SELECT status FROM sync_events ORDER BY id DESC LIMIT 1")
+    suspend fun latestStatus(): String?
 }
 
 @Database(entities = [RecordIndex::class, SyncCursor::class, SyncEvent::class], version = 2, exportSchema = false)

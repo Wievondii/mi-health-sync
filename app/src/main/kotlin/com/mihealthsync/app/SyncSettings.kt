@@ -21,6 +21,7 @@ internal data class Settings(
     val overlapHours: Int = 48,
     val enabled: Set<Metric> = Metric.entries.toSet(),
     val retryUntilMillis: Long = 0,
+    val autoRenewal: Boolean = false,
 )
 
 internal class SyncSettings(context: Context) {
@@ -40,6 +41,7 @@ internal class SyncSettings(context: Context) {
             preferences[METRICS] = next.enabled.map { it.name }.toSet()
             preferences[METRICS_ADDED] = true
             preferences[RETRY] = next.retryUntilMillis
+            preferences[AUTO_RENEWAL] = next.autoRenewal
         }
     }
 
@@ -54,6 +56,7 @@ internal class SyncSettings(context: Context) {
         }
             ?: Metric.entries.toSet(),
         retryUntilMillis = prefs[RETRY] ?: 0,
+        autoRenewal = prefs[AUTO_RENEWAL] ?: false,
     )
 
     private companion object {
@@ -65,5 +68,6 @@ internal class SyncSettings(context: Context) {
         val METRICS = stringSetPreferencesKey("metrics")
         val METRICS_ADDED = booleanPreferencesKey("extended_metrics_added")
         val RETRY = longPreferencesKey("retry_until")
+        val AUTO_RENEWAL = booleanPreferencesKey("auto_renewal")
     }
 }

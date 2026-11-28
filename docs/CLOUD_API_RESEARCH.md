@@ -62,3 +62,8 @@
 官方服务或自用路线都要求平台接受该账号的正常登录和数据请求。申请二维码返回 HTTP 200 和业务码 0，二维码资源返回 HTTP 200 和 `image/png`。根据 `mifit` 实现，已构建阶段 0 Android 验证包。自用路线实现等待本人扫码、使用小米签发的短期会话，只在手机内存中处理数据。账号安全挑战或平台拒绝会停止读取，账号级续期凭据不保留。另一个开源项目报告部分账号可能收到 `70036`，须以本人实测为准。 [源码](https://github.com/Jenwein/mifit/blob/ed8fd7f36ca9729f94471cbb85428a1435ea7b72/src/mifit/auth/qr.py#L397-L558) · [扫码失败记录](https://github.com/Zhou-Ruichen/mi-health-mcp)
 
 真实心率的最低验收已达成。用户扫码后在 Redmi Note 12 Turbo 上核对数值、时间和单位一致，ADB 复核验证包的确认状态。随后开始正式 App 接入，静息心率、血氧、步数、跨日睡眠、历史窗口、续页及最新数据延迟仍需逐项在该账号上验证。 [测试报告](TEST_REPORT.md)
+
+## 2026-11-28 · 授权续期和云端变更通知
+
+- 个人扫码流程可由小米签发账号级续期凭据。v0.3.2 默认关闭续期。主动开启并完成一次小米授权后，凭据随会话由 Android Keystore 加密保存在手机上，在读取收到 HTTP 401 时尝试续期一次，成功后重试原查询。关闭续期或退出账号时清除该凭据。旧版会话不含该凭据。 [开源客户端的续期实现](https://github.com/Jenwein/mifit/blob/ed8fd7f36ca9729f94471cbb85428a1435ea7b72/src/mifit/auth/renew.py)
+- 小米开放平台提供步数、心率、睡眠等数据变更通知。接入需通过数据权限审核、由用户完成相应的应用授权，并使用公网 HTTPS 回调接收和验证通知。个人扫码链路未找到可验证的推送入口。客户端的分页标记仅用于续页，参考项目的增量水位仍需主动查询。现有无服务器设计保留 WorkManager 定期检查。 [服务接入流程](https://dev.mi.com/xiaomihyperos/documentation/detail?pId=2326) · [云服务接口](https://dev.mi.com/xiaomihyperos/documentation/detail?pId=2328)

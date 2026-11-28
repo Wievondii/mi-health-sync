@@ -14,8 +14,8 @@ android {
         applicationId = "com.mihealthsync.app"
         minSdk = 28
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.3.0"
+        versionCode = 7
+        versionName = "0.3.3"
     }
     buildFeatures.compose = true
     compileOptions {
